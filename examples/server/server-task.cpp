@@ -1,6 +1,11 @@
 #include "server-task.h"
 #include "server-chat.h"
 
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+
 json result_timings::to_json() const {
     json base = {
         {"prompt_n",               prompt_n},
@@ -1060,6 +1065,299 @@ size_t server_prompt::size() const {
     return res;
 }
 
+static const char     IKPC_MAGIC[4] = { 'I', 'K', 'P', 'C' };
+static const uint32_t IKPC_VERSION  = 1;
+
+// a corrupt or truncated file must be rejected rather than allocated for
+static const uint64_t IKPC_MAX_META = 64ull * 1024ull * 1024ull;
+
+// the cache files never leave the machine that wrote them, so the fixed width
+// fields are stored in native byte order and the fingerprint catches everything else
+static bool ikpc_read(std::ifstream & f, void * data, size_t size) {
+    f.read((char *) data, size);
+    return (size_t) f.gcount() == size;
+}
+
+static std::string ikpc_file_name(const server_tokens & tokens) {
+    uint64_t h = 14695981039346656037ull;
+    const std::vector<llama_token> & tok = tokens.get_text_tokens();
+    for (size_t i = 0; i < tok.size(); ++i) {
+        const uint32_t t = (uint32_t) tok[i];
+        for (int b = 0; b < 4; ++b) {
+            h ^= (uint64_t) ((t >> (8*b)) & 0xff);
+            h *= 1099511628211ull;
+        }
+    }
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%016llx.ikcache", (unsigned long long) h);
+
+    return std::string(buf);
+}
+
+// reads everything in a cache file except the state blob, leaving the stream
+// positioned on it. returns false if the file is not ours, is from another build
+// or another model, or is truncated
+static bool ikpc_read_header(std::ifstream & f, const std::string & fingerprint, json & meta, uint64_t & blob_len) {
+    char magic[4];
+    if (!ikpc_read(f, magic, sizeof(magic)) || memcmp(magic, IKPC_MAGIC, sizeof(magic)) != 0) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    if (!ikpc_read(f, &version, sizeof(version)) || version != IKPC_VERSION) {
+        return false;
+    }
+
+    uint32_t fp_len = 0;
+    if (!ikpc_read(f, &fp_len, sizeof(fp_len)) || fp_len != fingerprint.size()) {
+        return false;
+    }
+
+    std::string fp(fp_len, '\0');
+    if (fp_len > 0 && !ikpc_read(f, &fp[0], fp_len)) {
+        return false;
+    }
+    if (fp != fingerprint) {
+        return false;
+    }
+
+    uint64_t meta_len = 0;
+    if (!ikpc_read(f, &meta_len, sizeof(meta_len)) || meta_len > IKPC_MAX_META) {
+        return false;
+    }
+
+    std::string meta_str(meta_len, '\0');
+    if (meta_len > 0 && !ikpc_read(f, &meta_str[0], meta_len)) {
+        return false;
+    }
+
+    if (!ikpc_read(f, &blob_len, sizeof(blob_len))) {
+        return false;
+    }
+
+    meta = json::parse(meta_str, nullptr, false);
+
+    return !meta.is_discarded();
+}
+
+void server_prompt_cache::disk_remove(server_prompt & prompt) {
+    if (disk_dir.empty() || prompt.disk_file.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(std::filesystem::path(disk_dir) / prompt.disk_file, ec);
+
+    prompt.disk_file.clear();
+}
+
+size_t server_prompt_cache::disk_size() const {
+    if (disk_dir.empty()) {
+        return 0;
+    }
+
+    size_t res = 0;
+    for (const auto & state : states) {
+        if (state.disk_file.empty()) {
+            continue;
+        }
+
+        std::error_code ec;
+        const auto n = std::filesystem::file_size(std::filesystem::path(disk_dir) / state.disk_file, ec);
+        if (!ec) {
+            res += (size_t) n;
+        }
+    }
+
+    return res;
+}
+
+void server_prompt_cache::persist(server_prompt & prompt) {
+    if (disk_dir.empty() || prompt.data.empty()) {
+        return;
+    }
+
+    // a state that refers to media chunks cannot be restored into a fresh process
+    if (prompt.tokens.has_mtmd) {
+        LLAMA_LOG_INFO("%s", " - not persisting a multimodal prompt\n");
+        return;
+    }
+
+    const std::string name = ikpc_file_name(prompt.tokens);
+    const std::string path = (std::filesystem::path(disk_dir) / name).string();
+    const std::string tmp  = path + ".tmp";
+
+    json j = prompt.to_json();
+    j["think_exclude"] = prompt.think_tokens.exclude;
+    j["think_begin"]   = prompt.think_tokens.begin;
+    j["think_end"]     = prompt.think_tokens.end;
+
+    const std::string meta = j.dump();
+
+    const uint32_t fp_len   = (uint32_t) fingerprint.size();
+    const uint64_t meta_len = (uint64_t) meta.size();
+    const uint64_t blob_len = (uint64_t) prompt.data.size();
+
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            LLAMA_LOG_WARN("failed to open %s for writing, prompt not persisted\n", tmp.c_str());
+            return;
+        }
+
+        f.write(IKPC_MAGIC, sizeof(IKPC_MAGIC));
+        f.write((const char *) &IKPC_VERSION, sizeof(IKPC_VERSION));
+        f.write((const char *) &fp_len, sizeof(fp_len));
+        f.write(fingerprint.data(), fp_len);
+        f.write((const char *) &meta_len, sizeof(meta_len));
+        f.write(meta.data(), meta_len);
+        f.write((const char *) &blob_len, sizeof(blob_len));
+        f.write((const char *) prompt.data.data(), blob_len);
+        f.flush();
+
+        if (!f) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            LLAMA_LOG_WARN("failed to write %s, prompt not persisted\n", tmp.c_str());
+            return;
+        }
+    }
+
+    // rename only after the whole file is on disk, so an interrupted write can
+    // never leave a truncated state that a later run would restore as garbage
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+        LLAMA_LOG_WARN("failed to rename %s, prompt not persisted\n", tmp.c_str());
+        return;
+    }
+
+    LLAMA_LOG_INFO(" - persisted prompt to %s (%.3f MiB)\n", name.c_str(), blob_len / (1024.0 * 1024.0));
+
+    prompt.disk_file = name;
+
+    // with --cache-ram 0 the disk is the only tier, so the blob does not stay resident
+    if (!ram_tier) {
+        prompt.data.clear();
+        prompt.data.shrink_to_fit();
+    }
+}
+
+bool server_prompt_cache::fetch(server_prompt & prompt) {
+    if (disk_dir.empty() || prompt.disk_file.empty()) {
+        return false;
+    }
+
+    const std::string path = (std::filesystem::path(disk_dir) / prompt.disk_file).string();
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        LLAMA_LOG_WARN("failed to open %s, dropping the entry\n", path.c_str());
+        disk_remove(prompt);
+        return false;
+    }
+
+    json     meta;
+    uint64_t blob_len = 0;
+    if (!ikpc_read_header(f, fingerprint, meta, blob_len)) {
+        LLAMA_LOG_WARN("%s is not usable by this build, dropping it\n", path.c_str());
+        disk_remove(prompt);
+        return false;
+    }
+
+    std::vector<uint8_t> blob;
+    try {
+        blob.resize(blob_len);
+    } catch (const std::bad_alloc & e) {
+        LLAMA_LOG_WARN("failed to allocate %llu bytes for %s: %s\n", (unsigned long long) blob_len, path.c_str(), e.what());
+        return false;
+    }
+
+    if (blob_len > 0 && !ikpc_read(f, blob.data(), blob_len)) {
+        LLAMA_LOG_WARN("%s is truncated, dropping it\n", path.c_str());
+        disk_remove(prompt);
+        return false;
+    }
+
+    LLAMA_LOG_INFO(" - read prompt from %s (%.3f MiB)\n", prompt.disk_file.c_str(), blob_len / (1024.0 * 1024.0));
+
+    prompt.data = std::move(blob);
+
+    return true;
+}
+
+void server_prompt_cache::restore_index() {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(disk_dir, ec);
+    if (ec) {
+        LLAMA_LOG_WARN("cannot use %s for the prompt cache: %s\n", disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+
+    int n_loaded  = 0;
+    int n_dropped = 0;
+
+    std::filesystem::directory_iterator it(disk_dir, ec);
+    if (ec) {
+        LLAMA_LOG_WARN("cannot read %s: %s\n", disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+
+    for (const auto & entry : it) {
+        const std::filesystem::path & path = entry.path();
+        if (path.extension() != ".ikcache") {
+            continue;
+        }
+
+        std::ifstream f(path, std::ios::binary);
+        json     meta;
+        uint64_t blob_len = 0;
+        if (!f || !ikpc_read_header(f, fingerprint, meta, blob_len)) {
+            // written by another model, another build, or an interrupted write
+            std::filesystem::remove(path, ec);
+            ++n_dropped;
+            continue;
+        }
+
+        auto & prompt = states.emplace_back();
+        try {
+            prompt.from_json(meta);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("failed to read the metadata of %s: %s\n", path.filename().string().c_str(), e.what());
+            states.pop_back();
+            std::filesystem::remove(path, ec);
+            ++n_dropped;
+            continue;
+        }
+
+        if (prompt.tokens.size() == 0) {
+            // the matching loop divides by the token count
+            states.pop_back();
+            std::filesystem::remove(path, ec);
+            ++n_dropped;
+            continue;
+        }
+
+        prompt.think_tokens.exclude = meta.value("think_exclude", prompt.think_tokens.exclude);
+        prompt.think_tokens.begin   = meta.value("think_begin",   prompt.think_tokens.begin);
+        prompt.think_tokens.end     = meta.value("think_end",     prompt.think_tokens.end);
+        prompt.disk_file            = path.filename().string();
+
+        ++n_loaded;
+    }
+
+    LLAMA_LOG_INFO("prompt cache restored from %s: %d prompts, %d dropped, %.3f MiB on disk\n",
+        disk_dir.c_str(), n_loaded, n_dropped, disk_size() / (1024.0 * 1024.0));
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1127,10 +1425,19 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
     if (it_best != states.end()) {
         LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
+        // a disk-resident entry took part in the matching above with its tokens only,
+        // so its blob is read back here, now that it has actually won
+        if (it_best->data.empty() && !fetch(*it_best)) {
+            states.erase(it_best);
+            return false;
+        }
+
         const size_t size = it_best->data.size();
         const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
         if (n != size) {
             LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
+            disk_remove(*it_best);
+            states.erase(it_best);
             return false;
         }
 
@@ -1160,6 +1467,7 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         // next, remove any cached prompts that are fully contained in the current prompt
         else if (len == it->tokens.size()) {
             LLAMA_LOG_INFO(" - removing obsolete cached prompt with length %d\n", (int)len);
+            disk_remove(*it);
             it = states.erase(it);
         }
         else {
@@ -1202,15 +1510,53 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
 
 void server_prompt_cache::update() {
     if (limit_size > 0) {
+        // an entry that is already on disk only has to give up its blob: it stays in
+        // the index, keeps matching on its tokens, and is read back if it ever wins
+        for (auto it = states.begin(); it != states.end() && size() > limit_size; ++it) {
+            if (it->data.empty() || it->disk_file.empty()) {
+                continue;
+            }
+
+            LLAMA_LOG_INFO(" - cache size limit reached, dropping the in-memory copy of %s (size = %.3f MiB)\n",
+                it->disk_file.c_str(), it->size() / (1024.0 * 1024.0));
+
+            it->data.clear();
+            it->data.shrink_to_fit();
+        }
+
         // always keep at least one state, regardless of the limits
         while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
+            auto it = states.begin();
+            while (it != states.end() && it->data.empty()) {
+                ++it;
+            }
+            if (it == states.end()) {
                 break;
             }
 
-            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            disk_remove(*it);
+            states.erase(it);
+        }
+    }
+
+    if (!disk_dir.empty() && limit_disk_size > 0) {
+        while (states.size() > 1 && disk_size() > limit_disk_size) {
+            auto it = states.begin();
+            while (it != states.end() && it->disk_file.empty()) {
+                ++it;
+            }
+            if (it == states.end()) {
+                break;
+            }
+
+            LLAMA_LOG_INFO(" - disk cache limit reached, removing oldest entry %s\n", it->disk_file.c_str());
+
+            disk_remove(*it);
+            if (it->data.empty()) {
+                states.erase(it);
+            }
         }
     }
 

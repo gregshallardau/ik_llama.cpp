@@ -559,6 +559,8 @@ struct gpt_params {
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens
+    std::string cache_disk_path = ""; // directory for the persistent prompt cache ("" = disable)
+    int32_t cache_disk_mib = 0;      // max size of the on-disk prompt cache in MiB, 0 = no limit
 
     // batched-bench params
     bool is_pp_shared = false;
