@@ -414,6 +414,51 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
     }
 }
 
+// -rtrd weight selection, per context. The sibling map lives on the model and is shared by every
+// context built on it (MTP's ctx_mtp included); only the phase - this graph's batch width - and
+// the trace counters are per context.
+void llama_context::rtrd_account(const struct ggml_tensor * w, bool took_sibling, int n) {
+    if      (took_sibling)                     rtrd_n_repacked  += n;
+    else if (model.repack_dual.sibling_of(w))  rtrd_n_original  += n;
+    else                                       rtrd_n_nosibling += n;
+}
+
+struct ggml_tensor * llama_context::rtrd_pick(struct ggml_tensor * w) {
+    if (!w) return w;
+    struct ggml_tensor * picked = model.repack_dual.pick(w, build_n_tokens);
+    rtrd_account(w, picked != w, 1);
+    return picked;
+}
+
+std::pair<struct ggml_tensor *, struct ggml_tensor *> llama_context::rtrd_pick2(struct ggml_tensor * up,
+                                                                                struct ggml_tensor * gate) {
+    auto picked = model.repack_dual.pick2(up, gate, build_n_tokens);
+    rtrd_account(up, picked.first != up, 1);
+    if (gate) rtrd_account(gate, picked.second != gate, 1);
+    return picked;
+}
+
+static const char * llama_mtp_op_type_name(llama_mtp_op_type t) {
+    switch (t) {
+        case MTP_OP_NONE:            return "none";
+        case MTP_OP_WARMUP:          return "warmup";
+        case MTP_OP_UPDATE_ACCEPTED: return "update_accepted";
+        case MTP_OP_DRAFT_GEN:       return "draft_gen";
+        default:                     return "?";
+    }
+}
+
+void llama_context::rtrd_trace_build() const {
+    static const bool trace = std::getenv("LLAMA_RTRD_TRACE") != nullptr;
+    if (!trace) return;
+    const auto & rd = model.repack_dual;
+    LLAMA_LOG_INFO("[rtrd] graph build: ctx=%p mtp_op=%-15s n_tokens=%-5d threshold=%-5d -> %-8s "
+            "(weights: %d repacked, %d original, %d without a sibling; model has %zu siblings)\n",
+            (const void *) this, llama_mtp_op_type_name(cparams.mtp_op_type), build_n_tokens,
+            rd.max_tokens, rtrd_n_repacked > 0 ? "REPACKED" : "ORIGINAL",
+            rtrd_n_repacked, rtrd_n_original, rtrd_n_nosibling, rd.siblings.size());
+}
+
 bool llama_model::repack_dual_data::refresh(const struct ggml_tensor * t) {
     auto it = siblings.find(t);
     if (it == siblings.end()) return true; // nothing to keep in sync
@@ -6569,12 +6614,36 @@ static bool prepare_mtp_graph_inputs(
 // return positive int on warning
 // return negative int on error
 //
+// LLAMA_RTRD_TRACE: one line per llama_decode() call, with the context, the MTP op it ran under,
+// the batch width and the wall time. This is what separates "the MTP warmup ran once over the
+// whole prompt" from "it ran once per token" - and it attributes time to the right context, which
+// the server's prompt_ms cannot do because both contexts' work lands in the same timer.
+namespace {
+struct llama_decode_trace {
+    const llama_context * ctx;
+    uint32_t              n_tokens;
+    int64_t               t0;
+    bool                  on;
+    llama_decode_trace(const llama_context & c, uint32_t n)
+        : ctx(&c), n_tokens(n), t0(0), on(std::getenv("LLAMA_RTRD_TRACE") != nullptr) {
+        if (on) t0 = ggml_time_us();
+    }
+    ~llama_decode_trace() {
+        if (!on) return;
+        LLAMA_LOG_INFO("[rtrd] decode: ctx=%p mtp_op=%-15s n_tokens=%-5u %8.2f ms\n",
+                (const void *) ctx, llama_mtp_op_type_name(ctx->cparams.mtp_op_type),
+                n_tokens, (ggml_time_us() - t0)/1000.0);
+    }
+};
+}
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to batch
 
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
+    const llama_decode_trace decode_trace(lctx, n_tokens_all);
 
     if (n_tokens_all == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0", __func__);

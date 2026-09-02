@@ -10,6 +10,7 @@ struct llama_model;
 
 #include <vector>
 #include <map>
+#include <utility>
 #include <set>
 #include <memory>
 
@@ -346,11 +347,28 @@ struct llama_context {
     bool has_evaluated_once = false;
 
     // Number of tokens in the u-batch the current compute graph is being built for. Set by
-    // llm_build_context's constructor and read by llm_build_lora_mm()/llm_build_lora_mm_id() to
-    // pick between the original and the run-time-repacked copy of a weight (see -rtrd). A change
-    // in n_tokens already forces a graph rebuild (llama_context::can_reuse_graph), so whatever a
-    // graph picks stays valid for as long as that graph is reused.
+    // llm_build_context's constructor and read by the -rtrd weight pickers below to choose
+    // between the original and the run-time-repacked copy of a weight. A change in n_tokens
+    // already forces a graph rebuild (llama_context::can_reuse_graph), so whatever a graph picks
+    // stays valid for as long as that graph is reused.
     int32_t build_n_tokens = 0;
+
+    // -rtrd weight selection. These delegate to llama_model::repack_dual (which owns the
+    // sibling map and is shared by every context on the model) and tally the outcome per graph
+    // build, so a context that is not the primary one - MTP's ctx_mtp, say - is accounted for
+    // separately. Reset by llm_build_context's constructor; reported by llama_build_graph()
+    // when LLAMA_RTRD_TRACE is set.
+    int32_t rtrd_n_repacked  = 0; // picked the repacked sibling (phase said "decode")
+    int32_t rtrd_n_original  = 0; // has a sibling, but the phase said "prefill"
+    int32_t rtrd_n_nosibling = 0; // no sibling exists: offloaded to a device, filtered out, or
+                                  // an ineligible type - -rtrd cannot affect this weight at all
+
+    void rtrd_account(const struct ggml_tensor * w, bool took_sibling, int n);
+    struct ggml_tensor * rtrd_pick(struct ggml_tensor * w);
+    std::pair<struct ggml_tensor *, struct ggml_tensor *> rtrd_pick2(struct ggml_tensor * up,
+                                                                     struct ggml_tensor * gate);
+    // one line per graph build when LLAMA_RTRD_TRACE is set in the environment
+    void rtrd_trace_build() const;
 
     int64_t t_start_us;
     int64_t t_load_us;
