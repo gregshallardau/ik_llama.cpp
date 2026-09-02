@@ -11,6 +11,7 @@
 #include <vector>
 #include <unordered_map>
 #include <set>
+#include <utility>
 
 #include "llama-reload-info.h"
 
@@ -600,6 +601,58 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // Dual tensor representation (-rtrd). For every repack-eligible weight we keep a *second*,
+    // row-interleaved ("_R4"/"_R8"/...) copy of the very same data next to the original, so the
+    // graph builder can pick the layout that suits the current phase - the original for prompt
+    // processing (where iqk_mul_mat's on-the-fly conversion wins) and the repacked one for token
+    // generation - without a reload. The repack is a pure layout shuffle, so the two copies are
+    // numerically identical and cost exactly 2x the bytes of the tensors that get a sibling.
+    struct repack_dual_data {
+        std::vector<struct ggml_context *>  ctxs;
+        std::vector<ggml_backend_buffer_t>  bufs;
+        // keyed on the *original* tensor pointer
+        std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> siblings;
+
+        size_t bytes      = 0;  // extra memory held by the repacked copies
+        int    max_tokens = 0;  // use the repacked copy when n_tokens <= max_tokens
+
+        bool enabled() const { return max_tokens > 0 && !siblings.empty(); }
+
+        // repacked sibling of `t`, or nullptr if it has none
+        struct ggml_tensor * sibling_of(const struct ggml_tensor * t) const {
+            if (siblings.empty()) return nullptr;
+            auto it = siblings.find(t);
+            return it == siblings.end() ? nullptr : it->second;
+        }
+
+        // Re-derive the sibling of `t` after something mutated `t`'s data in place. Returns
+        // false if the refresh failed, in which case the (now stale) sibling is dropped.
+        bool refresh(const struct ggml_tensor * t);
+
+        // the tensor to feed to mul_mat for a batch of `n_tokens` tokens
+        struct ggml_tensor * pick(struct ggml_tensor * t, int n_tokens) const {
+            if (!t || !enabled() || n_tokens > max_tokens) return t;
+            auto s = sibling_of(t);
+            return s ? s : t;
+        }
+
+        // Same, for the two operands of a fused up/gate op. Those kernels only fuse when both
+        // weights have the same type, so it is either both siblings or neither. (A mismatch is
+        // still numerically correct - ggml falls back to two separate matmuls - but it silently
+        // gives up the fusion, so don't create one.)
+        std::pair<struct ggml_tensor *, struct ggml_tensor *>
+        pick2(struct ggml_tensor * up, struct ggml_tensor * gate, int n_tokens) const {
+            if (!gate) return { pick(up, n_tokens), nullptr };  // merged up+gate tensor
+            if (!enabled() || n_tokens > max_tokens) return { up, gate };
+            auto su = sibling_of(up);
+            auto sg = sibling_of(gate);
+            if (!su || !sg) return { up, gate };
+            return { su, sg };
+        }
+    };
+
+    repack_dual_data repack_dual;
 
     int64_t t_load_us = 0;
     int64_t t_start_us = 0;

@@ -89,7 +89,11 @@ llm_build_context::llm_build_context(
         clear_lctx_inputs(clear_lctx_inputs),
         cb               (cb),
         buf_compute_meta (buf_compute_meta_override ? *buf_compute_meta_override : lctx.buf_compute_meta) {
-            // all initializations should be done in init()
+            // Record the batch width this graph is being built for. llm_build_lora_mm() and
+            // llm_build_lora_mm_id() are static (they only get `lctx`), so this is how they learn
+            // which phase - prefill or token generation - the graph belongs to.
+            lctx.build_n_tokens = n_tokens;
+            // all other initializations should be done in init()
 }
 
 void llm_build_context::init() {
@@ -972,7 +976,10 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
          struct ggml_context * ctx0,
           struct ggml_tensor * w,
           struct ggml_tensor * cur) {
-    struct ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // Dual tensor representation (-rtrd): the matmul runs against whichever of the two resident
+    // layouts suits this graph's batch width. Everything else below - and in particular the LoRA
+    // weight lookup, which is keyed on the tensor pointer - must keep using the original `w`.
+    struct ggml_tensor * res = ggml_mul_mat(ctx0, lctx.model.repack_dual.pick(w, lctx.build_n_tokens), cur);
     for (auto & it : lctx.lora_adapters) {
         struct llama_lora_weight * lora = it.first->get_weight(w);
         if (lora == nullptr) {
@@ -1018,7 +1025,9 @@ ggml_tensor * llm_build_context::llm_build_lora_mm_id(
           struct ggml_tensor * w,   // struct ggml_tensor * as
           struct ggml_tensor * cur, // struct ggml_tensor * b
           struct ggml_tensor * ids) {
-    struct ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    // see llm_build_lora_mm() - the substitution is confined to the matmul, the LoRA lookup below
+    // stays keyed on the original tensor pointer
+    struct ggml_tensor * res = ggml_mul_mat_id(ctx0, lctx.model.repack_dual.pick(w, lctx.build_n_tokens), cur, ids);
     for (auto & it : lctx.lora_adapters) {
         struct llama_lora_weight * lora = it.first->get_weight(w);
         if (lora == nullptr) {
@@ -1187,7 +1196,11 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             if (input->op != GGML_OP_REDUCE) {
                 cur->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
             }
-            cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
+            {
+                // -rtrd: fused up/gate needs both operands in the same layout, so pick as a pair
+                auto ug = lctx.model.repack_dual.pick2(split_u, split_g, lctx.build_n_tokens);
+                cur = ggml_fused_up_gate(ctx, ug.first, ug.second, cur, unary_op);
+            }
             cb(cur, "ffn_up_gate", il_cb);
             *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, lctx.model.arch == LLM_ARCH_BAILINGMOE3);
             cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
@@ -1246,7 +1259,10 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                         type_op == LLM_FFN_RELU ? GGML_UNARY_OP_RELU :
                         type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI;
-        cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
+        {
+            auto ug = lctx.model.repack_dual.pick2(up, gate, lctx.build_n_tokens);
+            cur = ggml_fused_up_gate(ctx, ug.first, ug.second, cur, unary_op);
+        }
         cb(cur, "ffn_up_gate", il);
         *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
         if (down) {
@@ -1584,12 +1600,14 @@ llm_expert_gating_func_type   gating_op,
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps) {
         if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
+            par = ggml_moe_up_gate_ext(ctx, lctx.model.repack_dual.pick(up_gate_exps, lctx.build_n_tokens),
+                    nullptr, cur, selected_experts, up_gate_exps_b, nullptr,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                     type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_gate_exps, nullptr, cur, selected_experts,
+            par = ggml_moe_up_gate(ctx, lctx.model.repack_dual.pick(up_gate_exps, lctx.build_n_tokens),
+                    nullptr, cur, selected_experts,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *((float *)(par->op_params + 1)) = lctx.model.swiglu_limit(il, false);
@@ -1597,13 +1615,14 @@ llm_expert_gating_func_type   gating_op,
     GGML_ASSERT(!up_gate_exps && !up_gate_exps_b);
 
     if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type) {
+        auto ug = lctx.model.repack_dual.pick2(up_exps, gate_exps, lctx.build_n_tokens);
         if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI) {
-            par = ggml_moe_up_gate_ext(ctx, up_exps, gate_exps, cur, selected_experts, up_exps_b, gate_exps_b,
+            par = ggml_moe_up_gate_ext(ctx, ug.first, ug.second, cur, selected_experts, up_exps_b, gate_exps_b,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
                     type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
         } else {
             GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_exps, gate_exps, cur, selected_experts,
+            par = ggml_moe_up_gate(ctx, ug.first, ug.second, cur, selected_experts,
                     type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
         }
         *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);

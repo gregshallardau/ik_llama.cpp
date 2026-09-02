@@ -8552,16 +8552,21 @@ int iqk_repacked_type(const struct ggml_tensor * tensor) {
     return rptr && tensor->ne[1] % rptr->num_rows == 0 ? (int)rptr->new_type : (int)tensor->type;
 }
 
-void iqk_repack_tensor(struct ggml_tensor * tensor) {
+namespace {
+// Row-interleaving shuffle shared by the in-place (iqk_repack_tensor) and the out-of-place
+// (iqk_repack_tensor_to) entry points. `dst` may alias tensor->data, in which case a per-thread
+// scratch buffer is used to stage the rows being interleaved. Does not touch tensor->type - that
+// is the caller's business, since the out-of-place variant leaves the source tensor alone.
+bool iqk_repack_tensor_impl(const struct ggml_tensor * tensor, char * dst) {
     constexpr int kChunk = 8;
-    if (!tensor) return;
-    if (!ggml_is_contiguous(tensor)) return;
-    if (is_forbidden_tensor(tensor->name)) return;
-    if (tensor->ne[1] % 4) return;
+    if (!tensor || !dst) return false;
+    if (!ggml_is_contiguous(tensor)) return false;
+    if (is_forbidden_tensor(tensor->name)) return false;
+    if (tensor->ne[1] % 4) return false;
 
     auto rptr = get_repack_info(tensor->type);
-    if (!rptr) return;
-    if (tensor->ne[1] % rptr->num_rows) return;
+    if (!rptr) return false;
+    if (tensor->ne[1] % rptr->num_rows) return false;
 
     auto& r = *rptr;
 
@@ -8575,21 +8580,26 @@ void iqk_repack_tensor(struct ggml_tensor * tensor) {
     //        int(tensor->ne[1]), num_chunks, nthread);
 
     std::atomic<int> counter(0);;
-    auto compute = [&counter, &r, tensor, num_chunks, chunkSize = kChunk] () {
+    auto compute = [&counter, &r, tensor, dst, num_chunks, chunkSize = kChunk] () {
         int nrows = ggml_nrows(tensor);
         int n_per_row = tensor->ne[0];
         auto row_size = ggml_row_size(tensor->type, n_per_row);
-        std::vector<char> qtmp(r.num_rows*row_size);
-        auto data = (char *)tensor->data;
+        auto src = (const char *)tensor->data;
+        const bool in_place = dst == src;
+        std::vector<char> qtmp(in_place ? r.num_rows*row_size : 0);
         while (true) {
             int chunk = counter.fetch_add(1);
             if (chunk >= num_chunks) break;
             int first_row = chunk*chunkSize*r.num_rows;
             int last_row = std::min(first_row + chunkSize*r.num_rows, nrows);
             for (int row = first_row; row < last_row; row += r.num_rows) {
-                std::memcpy(qtmp.data(), data + row*row_size, r.num_rows*row_size);
-                //r.repack(r.num_rows, n_per_row, qtmp.data(), data + row*row_size, true);
-                r.repack(r.num_rows, n_per_row, qtmp.data(), data + row*row_size, false);
+                if (in_place) {
+                    std::memcpy(qtmp.data(), src + row*row_size, r.num_rows*row_size);
+                    //r.repack(r.num_rows, n_per_row, qtmp.data(), dst + row*row_size, true);
+                    r.repack(r.num_rows, n_per_row, qtmp.data(), dst + row*row_size, false);
+                } else {
+                    r.repack(r.num_rows, n_per_row, src + row*row_size, dst + row*row_size, false);
+                }
             }
         }
     };
@@ -8598,7 +8608,21 @@ void iqk_repack_tensor(struct ggml_tensor * tensor) {
     compute();
     for (auto& w : workers) w.join();
 
-    tensor->type = r.new_type;
+    return true;
+}
+}
+
+void iqk_repack_tensor(struct ggml_tensor * tensor) {
+    if (!tensor) return;
+    auto rptr = get_repack_info(tensor->type);
+    if (!rptr) return;
+    if (iqk_repack_tensor_impl(tensor, (char *)tensor->data)) {
+        tensor->type = rptr->new_type;
+    }
+}
+
+bool iqk_repack_tensor_to(const struct ggml_tensor * tensor, void * dst_data) {
+    return iqk_repack_tensor_impl(tensor, (char *)dst_data);
 }
 
 void dequantize_row_ms_i2s(const void * vx, float * y, int64_t k) {

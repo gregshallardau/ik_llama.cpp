@@ -2214,6 +2214,24 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.use_mmap = false;
         return true;
     }
+    if (arg == "-rtrd" || arg == "--run-time-repack-dual") {
+        // Dual tensor representation. Unlike -rtr this keeps the original layout too, so mmap
+        // stays on: the originals can stay page-cache backed and only the repacked copies are
+        // unconditionally resident.
+        params.repack_dual_max_tokens = 32;
+        return true;
+    }
+    if (arg == "--repack-dual-max-tokens") {
+        CHECK_ARG
+        params.repack_dual_max_tokens = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--repack-dual-filter") {
+        CHECK_ARG
+        params.repack_dual_filter = argv[i];
+        if (params.repack_dual_max_tokens <= 0) params.repack_dual_max_tokens = 32;
+        return true;
+    }
     if (arg == "-thp" || arg == "--transparent-huge-pages") {
         params.use_thp = true;
         return true;
@@ -3302,6 +3320,12 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
         options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
     options.push_back({ "*",           "-rtr,   --run-time-repack",      "repack tensors if interleaved variant is available"});
+    options.push_back({ "*",           "-rtrd,  --run-time-repack-dual", "keep BOTH the original and the repacked layout of every eligible tensor and\n"
+                                                                        "pick per phase: original for prompt processing, repacked for token generation.\n"
+                                                                        "Costs ~2x the bytes of the eligible tensors."});
+    options.push_back({ "*",           "       --repack-dual-max-tokens N", "batch size at or below which -rtrd uses the repacked copy (default: 32)"});
+    options.push_back({ "*",           "       --repack-dual-filter REGEX", "give a second copy only to tensors whose name matches REGEX\n"
+                                                                        "(e.g. to leave the MoE experts single-copy and dual-path attention only)"});
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
@@ -4275,6 +4299,8 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
     mparams.repack_tensors  = params.repack_tensors;
+    mparams.repack_dual_max_tokens = params.repack_dual_max_tokens;
+    mparams.repack_dual_filter     = params.repack_dual_filter.empty() ? nullptr : params.repack_dual_filter.c_str();
     mparams.use_thp         = params.use_thp;
     mparams.validate_quants = params.validate_quants;
     mparams.merge_qkv       = params.merge_qkv;
@@ -5367,6 +5393,8 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "n_probs: %d # only used by server binary, default: 0\n", sparams.n_probs);
     fprintf(stream, "no_mmap: %s # default: false\n", !params.use_mmap ? "true" : "false");
     fprintf(stream, "repack: %s # default: false\n", params.repack_tensors ? "true" : "false");
+    fprintf(stream, "repack_dual_max_tokens: %d # default: 0\n", params.repack_dual_max_tokens);
+    fprintf(stream, "repack_dual_filter: %s\n", params.repack_dual_filter.c_str());
     fprintf(stream, "use_thp: %s # default: false\n", params.use_thp ? "true" : "false");
     fprintf(stream, "validate_quants: %s # default: false\n", params.validate_quants ? "true" : "false");
     fprintf(stream, "merge_qkv: %s # default: false\n", params.merge_qkv ? "true" : "false");

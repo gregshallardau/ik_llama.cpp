@@ -325,6 +325,11 @@ void repack_f32_bf16_r16 (const void * GGML_RESTRICT src, void * GGML_RESTRICT d
 void repack_bf16_bf16_r16(const void * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row);
 
 void iqk_repack_tensor(struct ggml_tensor * tensor);
+// Same row-interleaving shuffle as iqk_repack_tensor(), but the result is written into
+// `dst_data` instead of over `tensor->data`, leaving the original tensor untouched.
+// `dst_data` must be at least ggml_nbytes(tensor) bytes (the repack is size preserving).
+// Returns false (and writes nothing) if the tensor is not repack-eligible.
+bool iqk_repack_tensor_to(const struct ggml_tensor * tensor, void * dst_data);
 bool iqk_modify_tensor(struct ggml_tensor * tensor);
 
 int iqk_repacked_type(const struct ggml_tensor * tensor); // int instead of ggml_type so we don't need to include ggml.h

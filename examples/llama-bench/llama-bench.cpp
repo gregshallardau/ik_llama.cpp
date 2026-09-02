@@ -262,6 +262,7 @@ struct cmd_params {
     bool verbose;
     bool warmup;
     bool repack = false;
+    int  repack_dual = 0; // -rtrd: batch size at or below which the repacked copy is used (0 = off)
     bool fmoe = true;
     bool ger = false;     // ger = Grouped Expert Routing
     bool no_fug = false;
@@ -311,6 +312,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* warmup               */ true,
     /* repack               */ false,
+    /* repack_dual          */ 0,
     /* fmoe                 */ true,
     /* ger                  */ false,
     /* no_fug               */ false,
@@ -366,6 +368,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                       (default: %s)\n", cmd_params_defaults.verbose ? "1" : "0");
     printf("  -w, --warmup <0|1>                  (default: %s)\n", cmd_params_defaults.warmup ? "1" : "0");
     printf("  -rtr, --run-time-repack <0|1>       (default: %s)\n", cmd_params_defaults.repack ? "1" : "0");
+    printf("  -rtrd, --run-time-repack-dual <N>   keep both layouts resident, use the repacked one for n_tokens <= N (default: %d)\n", cmd_params_defaults.repack_dual);
     printf("  -cuda, --cuda-params <string>       (default: %s)\n", cmd_params_defaults.cuda_params.c_str());
     printf("  -mqkv, --merge-qkv                  (default: %s)\n", cmd_params_defaults.mqkv ? "1" : "0");
     printf("  -muge, --merge-up-gate-experts      (default: %s)\n", cmd_params_defaults.muge ? "1" : "0");
@@ -798,6 +801,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 break;
             }
             params.repack = std::stoi(argv[i]);
+        } else if (arg == "-rtrd" || arg == "--run-time-repack-dual") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            params.repack_dual = std::stoi(argv[i]);
         } else if (arg == "-cuda" || arg == "--cuda-params") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -979,6 +988,7 @@ struct cmd_params_instance {
     bool use_mmap;
     bool embeddings;
     bool repack = false;
+    int  repack_dual = 0;
     bool fmoe = true;
     bool ger = false;
     bool no_fug = false;
@@ -1006,6 +1016,7 @@ struct cmd_params_instance {
         mparams.tensor_split = tensor_split.data();
         mparams.use_mmap = use_mmap;
         mparams.repack_tensors = repack;
+        mparams.repack_dual_max_tokens = repack_dual;
         mparams.use_thp = use_thp;
         mparams.merge_qkv = mqkv;
         mparams.merge_up_gate_exps = muge;
@@ -1029,6 +1040,7 @@ struct cmd_params_instance {
                main_gpu == other.main_gpu &&
                use_mmap == other.use_mmap &&
                repack == other.repack &&
+               repack_dual == other.repack_dual &&
                mqkv == other.mqkv &&
                muge == other.muge &&
                defer_experts == other.defer_experts &&
@@ -1120,6 +1132,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .repack       = */ params.repack,
+                /* .repack_dual  = */ params.repack_dual,
                 /* .fmoe         = */ params.fmoe,
                 /* .ger          = */ params.ger,
                 /* .no_fug       = */ params.no_fug,
@@ -1167,6 +1180,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .repack       = */ params.repack,
+                /* .repack_dual  = */ params.repack_dual,
                 /* .fmoe         = */ params.fmoe,
                 /* .ger          = */ params.ger,
                 /* .no_fug       = */ params.no_fug,
@@ -1214,6 +1228,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .repack       = */ params.repack,
+                /* .repack_dual  = */ params.repack_dual,
                 /* .fmoe         = */ params.fmoe,
                 /* .ger          = */ params.ger,
                 /* .no_fug       = */ params.no_fug,
@@ -1261,6 +1276,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .embeddings   = */ embd,
                 /* .repack       = */ params.repack,
+                /* .repack_dual  = */ params.repack_dual,
                 /* .fmoe         = */ params.fmoe,
                 /* .ger          = */ params.ger,
                 /* .no_fug       = */ params.no_fug,
@@ -1318,6 +1334,7 @@ struct test {
     bool use_mmap;
     bool embeddings;
     bool repack = false;
+    int  repack_dual = 0;
     bool fmoe = false;
     bool ger = false;
     bool no_fug = false;
@@ -1366,6 +1383,7 @@ struct test {
         use_mmap = inst.use_mmap;
         embeddings = inst.embeddings;
         repack = inst.repack;
+        repack_dual = inst.repack_dual;
         mqkv = inst.mqkv;
         muge = inst.muge;
         defer_experts = inst.defer_experts;
@@ -1480,6 +1498,9 @@ struct test {
             field == "avg_ns" || field == "stddev_ns" || field == "max_gpu") {
             return INT;
         }
+        if (field == "repack_dual") {
+            return INT;
+        }
         if (field == "cuda" || field == "vulkan" || field == "metal" ||
             field == "gpu_blas" || field == "blas" || field == "sycl" || field == "no_kv_offload" ||
             field == "flash_attn" || field == "use_mmap" || field == "embeddings" || field == "repack" || field == "use_thp" ||
@@ -1527,7 +1548,7 @@ struct test {
             std::to_string(main_gpu), std::to_string(no_kv_offload), std::to_string(flash_attn),
             std::to_string(mla_attn), std::to_string(attn_max_batch), ser_to_string(ser), std::to_string(reuse),
             tensor_split_str, std::to_string(use_mmap), std::to_string(embeddings),
-            std::to_string(repack), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(ger),
+            std::to_string(repack), std::to_string(repack_dual), std::to_string(mqkv), std::to_string(muge), std::to_string(defer_experts), std::to_string(fmoe), std::to_string(ger),
             std::to_string(no_fug), std::to_string(use_thp), std::to_string(no_ooae), std::to_string(rcache), std::to_string(sas),
             std::to_string(max_gpu),
             cuda_params, override_tensor,
@@ -1549,7 +1570,7 @@ struct test {
             "n_threads", "type_k", "type_v",
             "n_gpu_layers", "split_mode",
             "main_gpu", "no_kv_offload", "flash_attn", "mla_attn", "attn_max_batch", "ser", "reuse",
-            "tensor_split", "use_mmap", "embeddings", "repack", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
+            "tensor_split", "use_mmap", "embeddings", "repack", "repack_dual", "mqkv", "muge", "defer_experts", "fused_moe", "grouped_er",
             "no_fused_up_gate", "use_thp", "no_ooae", "rcache", "sas", "max_gpu", "cuda_params", "override_tensor",
             "n_prompt", "n_gen", "test_time",
             "avg_ns", "stddev_ns",
@@ -1730,6 +1751,9 @@ struct markdown_printer : public printer {
         if (field == "repack") {
             return 3;
         }
+        if (field == "repack_dual") {
+            return 5;
+        }
         if (field == "mqkv") {
             return 4;
         }
@@ -1808,6 +1832,9 @@ struct markdown_printer : public printer {
         }
         if (field == "repack") {
             return "rtr";
+        }
+        if (field == "repack_dual") {
+            return "rtrd";
         }
         if (field == "mqkv") {
             return "mqkv";
@@ -1927,6 +1954,9 @@ struct markdown_printer : public printer {
         }
         if (params.repack != cmd_params_defaults.repack) {
             fields.emplace_back("repack");
+        }
+        if (params.repack_dual != cmd_params_defaults.repack_dual) {
+            fields.emplace_back("repack_dual");
         }
         if (params.mqkv != cmd_params_defaults.mqkv) {
             fields.emplace_back("mqkv");

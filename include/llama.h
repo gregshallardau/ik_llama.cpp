@@ -406,6 +406,14 @@ extern "C" {
         // comma separated list of RPC servers to use for offloading
         const char * rpc_servers;
 
+        // Dual tensor representation: keep BOTH the original and the run-time-repacked layout of
+        // every eligible weight resident, and let the graph builder pick per phase. Costs ~2x the
+        // bytes of the eligible tensors. `repack_dual_max_tokens` is the batch size at or below
+        // which the repacked copy is used (0 disables the feature); `repack_dual_filter` is an
+        // optional ECMAScript regex a tensor name must match to get a second copy (NULL = all).
+        int32_t      repack_dual_max_tokens;
+        const char * repack_dual_filter;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.

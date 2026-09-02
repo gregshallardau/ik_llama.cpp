@@ -414,7 +414,22 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
     }
 }
 
+bool llama_model::repack_dual_data::refresh(const struct ggml_tensor * t) {
+    auto it = siblings.find(t);
+    if (it == siblings.end()) return true; // nothing to keep in sync
+    if (iqk_repack_tensor_to(t, it->second->data)) return true;
+    LLAMA_LOG_WARN("%s: failed to refresh the repacked copy of %s, dropping it\n", __func__, t->name);
+    siblings.erase(it);
+    return false;
+}
+
 llama_model::~llama_model() {
+    for (struct ggml_context * ctx : repack_dual.ctxs) {
+        ggml_free(ctx);
+    }
+    for (ggml_backend_buffer_t buf : repack_dual.bufs) {
+        ggml_backend_buffer_free(buf);
+    }
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -3832,6 +3847,26 @@ static void llm_apply_khad_pretransform(llama_model & model) {
     }
 
     model.khad_pretransformed = (n_folded > 0);
+    // folding rewrote wv_b/wk_b_pp in place, so any repacked sibling built at load time is now
+    // stale and has to be re-derived from the folded weights
+    if (n_folded > 0 && !model.repack_dual.siblings.empty()) {
+        auto refresh_split_or_single = [&](ggml_tensor * full) {
+            if (!full) return;
+            if (full->extra) {
+                auto split = (const ggml_split_tensor_t *)full->extra;
+                for (int id = 0; id < split->n_device; ++id) {
+                    if (split->splits[id]) model.repack_dual.refresh(split->splits[id]);
+                }
+                return;
+            }
+            model.repack_dual.refresh(full);
+        };
+        for (auto & l : model.layers) {
+            if (!l.wv_b || !l.wk_b_pp) continue;
+            refresh_split_or_single(l.wv_b);
+            refresh_split_or_single(l.wk_b_pp);
+        }
+    }
     LLAMA_LOG_INFO("============ %s: folded H into wv_b/wk_b_pp on %d layers\n", __func__, n_folded);
 }
 
@@ -4208,6 +4243,108 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
     LLAMA_LOG_INFO("--------------------------------------------------------------------------\n");
     LLAMA_LOG_INFO("Total   : %9.2f, %9.2f, %9.2f MiB\n", tot_model/1024./1024., tot_cache/1024./1024., (tot_model + tot_cache)/1024./1024.);
     return std::make_pair(std::move(result), max_compute);
+}
+
+// Dual tensor representation (-rtrd).
+//
+// Build a second, row-interleaved copy of every repack-eligible weight and keep it alongside the
+// original instead of overwriting it (which is what plain -rtr does). The repack is a pure layout
+// shuffle - same bytes, same values, only the row ordering inside the tensor changes - so the two
+// copies are numerically identical and the graph builder can pick either one per phase.
+//
+// Only host-resident, non-view tensors are eligible: repacked types are CPU-only kernels, and a
+// view would alias somebody else's storage.
+static void llm_build_repack_dual(llama_model & model, const std::string & filter, int max_tokens) {
+    if (max_tokens <= 0) return;
+
+    std::unique_ptr<std::regex> re;
+    if (!filter.empty()) {
+        try {
+            re.reset(new std::regex(filter));
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: ignoring invalid --repack-dual-filter '%s': %s\n", __func__, filter.c_str(), e.what());
+        }
+    }
+
+    std::vector<ggml_tensor *> candidates;
+    size_t dual_bytes = 0;
+    size_t skipped    = 0;
+
+    for (auto & it : model.tensors_by_name) {
+        ggml_tensor * t = it.second;
+        if (!t || !t->buffer || t->view_src) continue;
+        if (!ggml_backend_buffer_is_host(t->buffer)) continue;
+        const auto repacked = (ggml_type) iqk_repacked_type(t);
+        if (repacked == t->type) continue; // no interleaved variant for this tensor
+        // The repack is size preserving for every weight type in the map; if that ever stops
+        // being true for some type, leave it single-copy rather than reason about the slack.
+        if (ggml_row_size(repacked, t->ne[0]) != ggml_row_size(t->type, t->ne[0])) {
+            LLAMA_LOG_WARN("%s: skipping %s: %s -> %s changes the row size\n", __func__, t->name,
+                    ggml_type_name(t->type), ggml_type_name(repacked));
+            continue;
+        }
+        if (re && !std::regex_search(it.first, *re)) { ++skipped; continue; }
+        candidates.push_back(t);
+        dual_bytes += ggml_nbytes(t);
+    }
+
+    if (candidates.empty()) {
+        LLAMA_LOG_WARN("%s: no repack-eligible tensors found, dual tensor representation disabled\n", __func__);
+        return;
+    }
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*candidates.size(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ctx_params);
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context, dual tensor representation disabled\n", __func__);
+        return;
+    }
+
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs; // original -> sibling
+    pairs.reserve(candidates.size());
+
+    for (ggml_tensor * t : candidates) {
+        ggml_tensor * d = ggml_new_tensor(ctx, (ggml_type) iqk_repacked_type(t), GGML_MAX_DIMS, t->ne);
+        GGML_ASSERT(ggml_nbytes(d) == ggml_nbytes(t));
+        ggml_format_name(d, "%s#rtrd", t->name);
+        pairs.emplace_back(t, d);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+    if (!buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB for the repacked tensor copies, "
+                "dual tensor representation disabled\n", __func__, dual_bytes/1024.0/1024.0);
+        ggml_free(ctx);
+        return;
+    }
+
+    for (auto & p : pairs) {
+        if (!iqk_repack_tensor_to(p.first, p.second->data)) {
+            // iqk_repacked_type() said yes, so this should not happen - but if it does, the
+            // sibling holds garbage, so drop it rather than use it
+            LLAMA_LOG_WARN("%s: repack of %s failed unexpectedly, skipping it\n", __func__, p.first->name);
+            p.second = nullptr;
+        }
+    }
+
+    model.repack_dual.ctxs.push_back(ctx);
+    model.repack_dual.bufs.push_back(buf);
+    model.repack_dual.max_tokens = max_tokens;
+    model.repack_dual.bytes      = ggml_backend_buffer_get_size(buf);
+    for (auto & p : pairs) {
+        if (p.second) model.repack_dual.siblings[p.first] = p.second;
+    }
+
+    LLAMA_LOG_INFO("============ Dual tensor representation: %zu tensors repacked into a second copy, "
+            "%.2f MiB extra, repacked layout used for n_tokens <= %d\n",
+            model.repack_dual.siblings.size(), model.repack_dual.bytes/1024.0/1024.0, max_tokens);
+    if (skipped > 0) {
+        LLAMA_LOG_INFO("============ %zu eligible tensors left single-copy by the name filter\n", skipped);
+    }
 }
 
 // Returns false if cancelled by progress_callback
@@ -4959,6 +5096,28 @@ static bool llm_load_tensors(
         if (n_repacked > 0) LLAMA_LOG_INFO("============ Repacked %d tensors\n", n_repacked);
     }
 
+    // Dual tensor representation: build the repacked siblings *next to* the originals. Unlike
+    // plain -rtr this does not need mmap disabled (the originals are only read), but it is
+    // incompatible with -rtr itself (which already consumed the originals in place) and with
+    // deferred expert mmap (whose whole point is to keep the experts non-resident).
+    if (!dry_run && ml.repack_dual_max_tokens > 0) {
+        if (ml.repack_tensors && !ml.use_mmap) {
+            LLAMA_LOG_WARN("%s: -rtr already repacked the tensors in place, ignoring the dual "
+                    "tensor representation request\n", __func__);
+        } else if (defer_expert_mmap) {
+            LLAMA_LOG_WARN("%s: deferred expert mmap keeps the experts out of RAM, which is the "
+                    "opposite of what the dual tensor representation does; ignoring the dual "
+                    "tensor representation request\n", __func__);
+        } else if (std::getenv("LLAMA_HOTSWAP_ENABLED") != nullptr) {
+            // hot-swap rewrites tensor data behind our back, which would leave the repacked
+            // copies stale
+            LLAMA_LOG_WARN("%s: LLAMA_HOTSWAP_ENABLED is set; ignoring the dual tensor "
+                    "representation request\n", __func__);
+        } else {
+            llm_build_repack_dual(model, ml.repack_dual_filter, ml.repack_dual_max_tokens);
+        }
+    }
+
     if (model.arch == LLM_ARCH_BITNET) {
         auto set_scale = [] (ggml_tensor * w, ggml_tensor * s) {
             if (!s) {
@@ -5005,6 +5164,9 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides);
+
+        ml.repack_dual_max_tokens = params.repack_dual_max_tokens;
+        ml.repack_dual_filter     = params.repack_dual_filter ? params.repack_dual_filter : "";
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -7871,6 +8033,8 @@ struct llama_model_params llama_model_default_params() {
         /*.tensor_split                =*/ nullptr,
         /*.fit_margin_array            =*/ nullptr,
         /*.rpc_servers                 =*/ nullptr,
+        /*.repack_dual_max_tokens      =*/ 0,
+        /*.repack_dual_filter          =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

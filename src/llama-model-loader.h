@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <map>
@@ -47,6 +48,9 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool check_tensors;
     bool repack_tensors = false;
+    // dual tensor representation (-rtrd); set by llama_model_load() from llama_model_params
+    int         repack_dual_max_tokens = 0;
+    std::string repack_dual_filter;
     bool use_thp = false;
     bool merge_qkv = false;
     bool merge_up_gate_exps = false;

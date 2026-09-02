@@ -450,6 +450,10 @@ struct gpt_params {
     bool batch_warmup      = false; // batch warmup run
     bool check_tensors     = false; // validate tensor data
     bool repack_tensors    = false; // repack tensors if interleaved variant is available
+    // dual tensor representation: keep the original AND the repacked layout of every eligible
+    // tensor resident, and pick per phase (original for prefill, repacked for token generation)
+    int  repack_dual_max_tokens = 0;  // use the repacked copy when n_tokens <= this (0 = off)
+    std::string repack_dual_filter;   // optional regex a tensor name must match to get a 2nd copy
     bool use_thp           = false; // use transparent huge pages (linux only)
     bool validate_quants   = false; // if true, check for NaNs while loading the model
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)

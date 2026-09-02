@@ -345,6 +345,13 @@ struct llama_context {
 
     bool has_evaluated_once = false;
 
+    // Number of tokens in the u-batch the current compute graph is being built for. Set by
+    // llm_build_context's constructor and read by llm_build_lora_mm()/llm_build_lora_mm_id() to
+    // pick between the original and the run-time-repacked copy of a weight (see -rtrd). A change
+    // in n_tokens already forces a graph rebuild (llama_context::can_reuse_graph), so whatever a
+    // graph picks stays valid for as long as that graph is reused.
+    int32_t build_n_tokens = 0;
+
     int64_t t_start_us;
     int64_t t_load_us;
     int64_t t_p_eval_us = 0;
