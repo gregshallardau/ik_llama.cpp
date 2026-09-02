@@ -618,8 +618,13 @@ llm_expert_gating_func_type   gating_op,
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 
+    // `lm_head_out_ids`, when given, trims the rows fed to the lm_head *after* result_norm has
+    // been named, so the full-width hidden states stay in the graph while the vocab-sized
+    // projection only runs on the rows whose logits are actually read back. Used by the MTP
+    // architectures that harvest per-token hidden states from result_norm.
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name = true);
+            ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name = true,
+            ggml_tensor * lm_head_out_ids = nullptr);
 
     static ggml_tensor * do_split_norm(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * the_norm, const llama_hparams & hparams,
         const llm_build_cb & cb, int id, int il_cb, bool is_norm);

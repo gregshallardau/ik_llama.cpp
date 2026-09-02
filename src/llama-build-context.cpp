@@ -2541,7 +2541,8 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
 }
 
 ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur,
-        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name) {
+        ggml_tensor * output, ggml_tensor * output_norm, const llm_build_cb & cb, bool add_normed_name,
+        ggml_tensor * lm_head_out_ids) {
     // lm_head
     if (output->extra) {
         auto split_output = (ggml_split_tensor_t *)output->extra;
@@ -2557,9 +2558,11 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
                 auto cur_normed = llm_build_context::llm_build_norm(ctx, cur, lctx.model.hparams, the_norm, NULL, LLM_NORM_RMS, cb, -1);
                 last_norm = cur_normed;
                 cb(cur_normed, "result_norm", 1000*(id+1));
-                o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, cur_normed));
+                auto lm_head_in = lm_head_out_ids ? ggml_get_rows(ctx, cur_normed, lm_head_out_ids) : cur_normed;
+                o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, lm_head_in));
             } else {
-                o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, cur));
+                auto lm_head_in = lm_head_out_ids ? ggml_get_rows(ctx, cur, lm_head_out_ids) : cur;
+                o.push_back(llm_build_context::llm_build_lora_mm(lctx, ctx, split, lm_head_in));
             }
             cb(o.back(), "output", id);
             if (add_normed_name && last_norm) {
@@ -2592,6 +2595,9 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
             if (add_normed_name) {
                 cb(cur, "result_norm", -1);
             }
+        }
+        if (lm_head_out_ids) {
+            cur = ggml_get_rows(ctx, cur, lm_head_out_ids);
         }
         cur = llm_build_context::llm_build_lora_mm(lctx, ctx, output, cur);
     }
