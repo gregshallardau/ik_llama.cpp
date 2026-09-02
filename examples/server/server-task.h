@@ -395,6 +395,12 @@ struct server_prompt {
 
     std::list<server_prompt_checkpoint> checkpoints;
 
+    // name of the on-disk copy, empty when this state has never been persisted.
+    // an entry with an empty `data` and a non-empty `disk_file` lives only on disk:
+    // it still takes part in matching (which reads `tokens` only) and its blob is
+    // read back by server_prompt_cache::fetch() if it wins.
+    std::string disk_file;
+
     size_t size() const;
 
     int n_tokens() const {
@@ -408,7 +414,8 @@ struct server_prompt {
             n_discarded_prompt,
             think_tokens,
             data,
-            checkpoints
+            checkpoints,
+            disk_file
         };
     }
 
@@ -429,10 +436,16 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(llama_context* ctx, int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(llama_context* ctx, int32_t limit_size_mib, size_t limit_tokens,
+                        const std::string & disk_dir = "", int32_t limit_disk_mib = 0,
+                        const std::string & fingerprint = "") {
         this->ctx = ctx;
         this->limit_size = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_dir = disk_dir;
+        this->limit_disk_size = 1024ull * 1024ull * (limit_disk_mib < 0 ? 0 : limit_disk_mib);
+        this->fingerprint = fingerprint;
+        this->ram_tier = limit_size_mib != 0;
     }
 
     std::list<server_prompt> states;
@@ -442,6 +455,22 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // directory holding the persistent copies, empty = disk tier disabled
+    std::string disk_dir;
+
+    // in bytes, 0 = no limit
+    size_t limit_disk_size = 0;
+
+    // identifies the model and context configuration these states were written by.
+    // a state is only meaningful to a byte-compatible setup, so restoring one written
+    // by a different model or KV type returns success and produces wrong output.
+    std::string fingerprint;
+
+    // false when --cache-ram 0 is combined with --cache-disk: states are written
+    // straight through to disk and their blobs are dropped from RAM immediately
+    bool ram_tier = true;
+
     llama_context* ctx;
     size_t size() const;
 
@@ -452,4 +481,22 @@ struct server_prompt_cache {
     bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
 
     void update();
+
+    // write one state to disk_dir so it survives a restart. no-op when the disk tier
+    // is off, when the prompt carries media, or when there is nothing to write.
+    void persist(server_prompt& prompt);
+
+    // read a disk-resident state's blob back into memory. on any failure the file is
+    // removed and false is returned, so the caller falls back to a normal prefill.
+    bool fetch(server_prompt& prompt);
+
+    // rebuild the index from disk_dir at startup. reads only each file's header and
+    // metadata, never the blobs, so a large cache still starts quickly.
+    void restore_index();
+
+    // delete a state's on-disk copy
+    void disk_remove(server_prompt& prompt);
+
+    // total bytes currently occupied on disk by the states in this cache
+    size_t disk_size() const;
 };

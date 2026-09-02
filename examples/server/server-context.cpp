@@ -14,6 +14,7 @@
 #include "mtmd-helper.h"
 
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <regex>
 #include <exception>
@@ -397,19 +398,45 @@ void server_context::init() {
         reuse_forced_off = true;
     }
 
-    if (params_base.cache_ram_mib != 0 && llama_model_supports_partial_kv_reuse(model)) {
+    const bool cache_enabled = params_base.cache_ram_mib != 0 || !params_base.cache_disk_path.empty();
+
+    if (cache_enabled && llama_model_supports_partial_kv_reuse(model)) {
         if (params_base.cache_ram_mib < 0) {
             LLAMA_LOG_INFO("prompt cache is enabled, size limit: %s\n", "no limit");
+        }
+        else if (params_base.cache_ram_mib == 0) {
+            LLAMA_LOG_INFO("%s", "prompt cache is enabled on disk only, states are not kept in RAM\n");
         }
         else {
             LLAMA_LOG_INFO("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
         }
         LLAMA_LOG_INFO("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+
+        // a saved state can only be restored by a byte compatible model and context
+        // configuration - restoring one written by anything else succeeds and then
+        // produces wrong output, so everything that changes the layout goes in here
+        std::string fingerprint = params_base.model;
+        {
+            std::error_code ec;
+            const auto n_bytes = std::filesystem::file_size(params_base.model, ec);
+            char buf[512];
+            snprintf(buf, sizeof(buf), "|bytes=%llu|n_ctx=%d|n_parallel=%d|type_k=%s|type_v=%s",
+                (unsigned long long) (ec ? 0 : n_bytes),
+                params_base.n_ctx,
+                params_base.n_parallel,
+                params_base.cache_type_k.c_str(),
+                params_base.cache_type_v.c_str());
+            fingerprint += buf;
+        }
+
         // only apply ram size limit. No token limit for now.
-        prompt_cache = std::make_unique<server_prompt_cache>(ctx, params_base.cache_ram_mib, 0);
+        prompt_cache = std::make_unique<server_prompt_cache>(ctx, params_base.cache_ram_mib, 0,
+            params_base.cache_disk_path, params_base.cache_disk_mib, fingerprint);
+
+        prompt_cache->restore_index();
     }
     else {
-        if (params_base.cache_ram_mib != 0) {
+        if (cache_enabled) {
             LLAMA_LOG_WARN("prompt cache is disabled because this model has private state outside the generic KV cache\n");
         } else if (!reuse_forced_off) {
             LLAMA_LOG_INFO("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
@@ -473,6 +500,8 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
     }
 
     llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
+
+    prompt_cache.persist(*cur);
 }
 
 void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
